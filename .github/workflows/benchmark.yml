@@ -1,0 +1,91 @@
+name: Multi-thread File Operation Benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'benchmark.py'
+      - 'generate_report.py'
+      - '.github/workflows/multithread-benchmark.yml'
+
+jobs:
+  benchmark-ubuntu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install 7-Zip
+        run: sudo apt-get update && sudo apt-get install -y p7zip-full p7zip-rar
+      - name: Run Benchmark
+        run: python benchmark.py
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-ubuntu
+          path: results/
+
+  benchmark-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check 7-Zip
+        shell: pwsh
+        run: |
+          if (Get-Command 7z -ErrorAction SilentlyContinue) {
+            Write-Host "7-Zip found"
+            7z i | Select-Object -First 1
+          } else {
+            Write-Host "7-Zip NOT found, will use fallback"
+          }
+      - name: Run Benchmark
+        run: python benchmark.py
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-windows
+          path: results/
+
+  benchmark-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install 7-Zip
+        run: brew install p7zip || echo "7-Zip install failed, will use fallback"
+      - name: Run Benchmark
+        run: python benchmark.py
+      - name: Upload Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-macos
+          path: results/
+
+  generate-report:
+    needs: [benchmark-ubuntu, benchmark-windows, benchmark-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: benchmark-*
+      - name: Merge and Generate Report
+        run: |
+          mkdir -p final-report
+          python generate_report.py
+      - name: Upload Final Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-analysis-report
+          path: final-report/
