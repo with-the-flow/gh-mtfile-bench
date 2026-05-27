@@ -8,6 +8,10 @@ on:
       - 'generate_report.py'
       - '.github/workflows/multithread-benchmark.yml'
 
+# env 必须放在 jobs 外面、on 下面，不能嵌套在 job 里
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   benchmark-ubuntu:
     runs-on: ubuntu-latest
@@ -35,15 +39,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Check 7-Zip
+      - name: Install 7-Zip
         shell: pwsh
         run: |
-          if (Get-Command 7z -ErrorAction SilentlyContinue) {
-            Write-Host "7-Zip found"
-            7z i | Select-Object -First 1
-          } else {
-            Write-Host "7-Zip NOT found, will use fallback"
-          }
+          $url = "https://www.7-zip.org/a/7z2409-x64.exe"
+          $output = "$env:TEMP\7z.exe"
+          Invoke-WebRequest -Uri $url -OutFile $output
+          Start-Process -FilePath $output -ArgumentList "/S /D=C:\Program Files\7-Zip" -Wait
+          echo "C:\Program Files\7-Zip" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Verify 7-Zip
+        shell: pwsh
+        run: 7z i | Select-Object -First 3
       - name: Run Benchmark
         run: python benchmark.py
       - name: Upload Results
@@ -61,7 +67,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install 7-Zip
-        run: brew install p7zip || echo "7-Zip install failed, will use fallback"
+        run: |
+          brew install p7zip || echo "p7zip already installed or skipped"
+      - name: Verify 7-Zip
+        run: 7z i | head -3
       - name: Run Benchmark
         run: python benchmark.py
       - name: Upload Results

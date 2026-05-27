@@ -13,7 +13,9 @@ import shutil
 import string
 import subprocess
 import sys
+import threading
 import time
+import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -124,10 +126,15 @@ def get_system_info() -> SystemInfo:
     )
 
 
-def random_content(size: int) -> str:
-    """生成指定长度的随机文本内容."""
+def write_random_content(f, size: int) -> None:
+    """流式写入随机文本，避免一次性生成大字符串."""
+    chunk_size = 8_192  # 8 KiB 分块
     chars = string.ascii_letters + string.digits + string.punctuation + " \n"
-    return "".join(random.choices(chars, k=size))
+    written = 0
+    while written < size:
+        to_write = min(chunk_size, size - written)
+        f.write("".join(random.choices(chars, k=to_write)))
+        written += to_write
 
 
 def generate_file_specs() -> List[FileSpec]:
@@ -171,11 +178,11 @@ def generate_file_specs() -> List[FileSpec]:
 # =============================================================================
 
 def write_single_file(base_dir: Path, spec: FileSpec) -> int:
-    """将单个文件写入磁盘."""
+    """将单个文件写入磁盘（流式，低内存）."""
     full_path = base_dir / spec.relative_path
     full_path.parent.mkdir(parents=True, exist_ok=True)
-    content = random_content(spec.size_bytes)
-    full_path.write_text(content, encoding="utf-8")
+    with open(full_path, "w", encoding="utf-8") as f:
+        write_random_content(f, spec.size_bytes)
     return spec.size_bytes
 
 
@@ -194,19 +201,39 @@ def run_with_threads(
     items: List[Tuple],
     worker: Callable,
     thread_count: int,
+    label: str = "",
 ) -> int:
-    """通用多线程执行封装，返回总处理字节数."""
+    """通用多线程执行封装，带进度心跳防 GitHub Actions kill."""
     total = 0
+    total_items = len(items)
+    report_interval = max(1, total_items // 10)
+    completed = 0
+
+    def print_progress() -> None:
+        if label:
+            print(
+                f"    [{label}] 进度: {completed}/{total_items}",
+                flush=True,
+            )
 
     if thread_count == 1:
-        for args in items:
+        for i, args in enumerate(items):
             total += worker(*args)
+            completed += 1
+            if (i + 1) % report_interval == 0:
+                print_progress()
         return total
 
     with ThreadPoolExecutor(max_workers=thread_count) as executor:
-        futures = [executor.submit(worker, *args) for args in items]
+        futures = {
+            executor.submit(worker, *args): idx
+            for idx, args in enumerate(items)
+        }
         for future in as_completed(futures):
             total += future.result()
+            completed += 1
+            if completed % report_interval == 0:
+                print_progress()
 
     return total
 
@@ -219,10 +246,31 @@ def timed_benchmark(
     note: str = "",
     fallback: bool = False,
 ) -> BenchmarkResult:
-    """统一计时包装器."""
+    """统一计时包装器，带心跳输出防 10 分钟无输出 kill."""
     prepare()
+
+    # GitHub Actions 步骤 10 分钟无输出会被 kill，每 2 分钟心跳一次
+    heartbeat_stop = threading.Event()
+    heartbeat_count = [0]
+
+    def heartbeat() -> None:
+        while not heartbeat_stop.wait(120):  # 2 分钟
+            heartbeat_count[0] += 1
+            print(
+                f"    [心跳 #{heartbeat_count[0]}] 测试运行中...",
+                flush=True,
+            )
+
+    timer = threading.Thread(target=heartbeat, daemon=True)
+    timer.start()
+
     start = time.perf_counter()
-    total_bytes = work()
+    try:
+        total_bytes = work()
+    finally:
+        heartbeat_stop.set()
+        timer.join(timeout=5)
+
     elapsed = time.perf_counter() - start
 
     total_mb = total_bytes / (1024 * 1024)
@@ -255,7 +303,9 @@ def benchmark_file_generation(
 
     def work() -> int:
         items = [(TEST_DIR, spec) for spec in specs]
-        return run_with_threads(items, write_single_file, thread_count)
+        return run_with_threads(
+            items, write_single_file, thread_count, label="写入"
+        )
 
     return timed_benchmark(thread_count, prepare, work)
 
@@ -299,26 +349,44 @@ def _benchmark_zip_with_7z(thread_count: int) -> BenchmarkResult:
             ZIP_PATH.unlink()
 
     def work() -> int:
+        # 使用列表模式避免通配符跨平台问题
+        file_list_path = TEST_DIR / "filelist.txt"
+        file_paths = [p for p in TEST_DIR.rglob("*") if p.is_file()]
+        with open(file_list_path, "w", encoding="utf-8") as f:
+            for fp in file_paths:
+                f.write(str(fp.resolve()) + "\n")
+
         cmd = [
             "7z", "a",
             "-tzip",
             f"-mmt{thread_count}",
             "-mx=1",  # 最快压缩级别
             str(ZIP_PATH),
-            str(TEST_DIR / "*"),
+            f"@{file_list_path}",
         ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,  # 10 分钟
+            )
+            if result.returncode != 0:
+                print(f"    7z stderr: {result.stderr[:500]}", flush=True)
+        except subprocess.TimeoutExpired:
+            print("    [错误] 7z 压缩超时（10分钟），强制降级", flush=True)
+            raise RuntimeError("7z timeout")
+        finally:
+            if file_list_path.exists():
+                file_list_path.unlink()
+
         return TOTAL_SIZE_BYTES
 
-    result = timed_benchmark(
-        thread_count, prepare, work, tool="7zip"
-    )
-
-    if not ZIP_PATH.exists():
-        print("  [降级] 7z 失败，回退到 Python zipfile")
+    try:
+        return timed_benchmark(thread_count, prepare, work, tool="7zip")
+    except Exception as e:
+        print(f"    [降级] 7z 失败 ({e})，回退到 Python zipfile", flush=True)
         return _benchmark_zip_with_python(thread_count)
-
-    return result
 
 
 def benchmark_file_copy(thread_count: int) -> BenchmarkResult:
@@ -336,7 +404,9 @@ def benchmark_file_copy(thread_count: int) -> BenchmarkResult:
             (src, dest_dir / src.relative_to(TEST_DIR))
             for src in src_files
         ]
-        total = run_with_threads(items, copy_single_file, thread_count)
+        total = run_with_threads(
+            items, copy_single_file, thread_count, label="复制"
+        )
         shutil.rmtree(dest_dir, ignore_errors=True)
         return total
 
@@ -371,9 +441,19 @@ def benchmark_zip_extract(
             f"-mmt{thread_count}",
             "-y",
         ]
-        subprocess.run(
-            cmd, capture_output=True, text=True, timeout=300
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=600,  # 10 分钟
+            )
+            if result.returncode != 0:
+                print(f"    7z stderr: {result.stderr[:500]}", flush=True)
+        except subprocess.TimeoutExpired:
+            print("    [错误] 7z 解压超时（10分钟），强制降级", flush=True)
+            raise RuntimeError("7z timeout")
+
         total = sum(
             f.stat().st_size for f in extract_dir.rglob("*") if f.is_file()
         )
@@ -381,11 +461,15 @@ def benchmark_zip_extract(
         return total
 
     if use_7zip:
-        result = timed_benchmark(
-            thread_count, prepare, work_7z, tool="7zip"
-        )
-        if not any(extract_dir.iterdir()):
-            print("  [降级] 7z 解压失败，回退到 Python zipfile")
+        try:
+            return timed_benchmark(
+                thread_count, prepare, work_7z, tool="7zip"
+            )
+        except Exception as e:
+            print(
+                f"    [降级] 7z 解压失败 ({e})，回退到 Python zipfile",
+                flush=True,
+            )
             return timed_benchmark(
                 thread_count,
                 prepare,
@@ -393,7 +477,6 @@ def benchmark_zip_extract(
                 tool="python_zipfile",
                 fallback=True,
             )
-        return result
 
     note = "zipfile 解压为单线程操作"
     return timed_benchmark(
@@ -408,14 +491,14 @@ def benchmark_zip_extract(
 def ensure_source_files(specs: List[FileSpec]) -> None:
     """确保测试源文件已生成."""
     if not TEST_DIR.exists() or not any(TEST_DIR.iterdir()):
-        print("  [准备] 源文件缺失，执行 4 线程预生成...")
+        print("  [准备] 源文件缺失，执行 4 线程预生成...", flush=True)
         benchmark_file_generation(specs, thread_count=4)
 
 
 def ensure_zip_archive(use_7zip: bool) -> None:
     """确保 ZIP 压缩包已存在."""
     if not ZIP_PATH.exists():
-        print("  [准备] 压缩包缺失，执行 4 线程预压缩...")
+        print("  [准备] 压缩包缺失，执行 4 线程预压缩...", flush=True)
         benchmark_zip_compression(thread_count=4, use_7zip=use_7zip)
 
 
@@ -425,7 +508,7 @@ def run_single_test(
     thread_counts: List[int],
 ) -> List[BenchmarkResult]:
     """执行单类测试的所有线程梯度."""
-    print(f"\n[{name}]")
+    print(f"\n[{name}]", flush=True)
     results: List[BenchmarkResult] = []
 
     for tc in thread_counts:
@@ -435,7 +518,8 @@ def run_single_test(
         print(
             f"耗时={result.elapsed_sec:7.3f}s "
             f"速度={result.speed_mbps:7.2f} MB/s "
-            f"工具={result.tool}{flag}"
+            f"工具={result.tool}{flag}",
+            flush=True,
         )
         results.append(result)
 
@@ -451,12 +535,12 @@ def cleanup_all() -> None:
 
 def run_experiment() -> ExperimentResults:
     """执行完整实验并返回结构化结果."""
-    print("=" * 60)
-    print("GitHub Actions 多线程文件操作性能实验")
-    print("=" * 60)
+    print("=" * 60, flush=True)
+    print("GitHub Actions 多线程文件操作性能实验", flush=True)
+    print("=" * 60, flush=True)
 
     sys_info = get_system_info()
-    print(f"\n[系统信息]\n{json.dumps(asdict(sys_info), indent=2)}\n")
+    print(f"\n[系统信息]\n{json.dumps(asdict(sys_info), indent=2)}\n", flush=True)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     specs = generate_file_specs()
@@ -511,11 +595,17 @@ def run_experiment() -> ExperimentResults:
     with open(output, "w", encoding="utf-8") as f:
         json.dump(asdict(results), f, indent=2)
 
-    print(f"\n[完成] 结果已保存: {output}")
+    print(f"\n[完成] 结果已保存: {output}", flush=True)
 
     cleanup_all()
     return results
 
 
 if __name__ == "__main__":
-    run_experiment()
+    try:
+        run_experiment()
+    except Exception as e:
+        print(f"\n[致命错误] 实验崩溃: {e}", flush=True)
+        traceback.print_exc()
+        cleanup_all()
+        sys.exit(1)
